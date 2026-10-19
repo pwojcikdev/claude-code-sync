@@ -50,6 +50,17 @@ fn settle_conflict(
     can_ask: bool,
     filter: &FilterConfig,
 ) -> Result<scm::ConflictChoice> {
+    // A desktop session entry both machines committed merges field by field,
+    // a tombstone keeps the later deletion, and a deleted entry stays deleted.
+    if let Some(choice) = crate::artifacts::desktop_sessions::settle_repo_conflict(file) {
+        println!(
+            "  {} {}: settled from both machines' session lists",
+            "✓".green(),
+            file.path
+        );
+        return Ok(choice);
+    }
+
     let differing_only_in_dates = match (&file.local, &file.remote) {
         (Some(local), Some(remote)) => keep_later_timestamps(local, remote),
         _ => None,

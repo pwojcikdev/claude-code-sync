@@ -95,6 +95,22 @@ pub struct FilterConfig {
     /// whenever the merge tool is offered.
     #[serde(default)]
     pub prefer_merge_tool: bool,
+
+    /// Where the Claude desktop app keeps its session list on this machine
+    /// (`claude-code-sessions/`), when it is not at the platform default
+    /// under the app's data directory. Only used by the `desktop-sessions`
+    /// artifact category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_sessions_dir: Option<PathBuf>,
+
+    /// The session list directory the `desktop-sessions` category actually
+    /// reads and writes: `desktop_sessions_dir`, else the platform default.
+    /// Filled in by [`FilterConfig::load`] and never written. A config built
+    /// in code — the tests' — has none, and the category then touches
+    /// nothing: the artifact engine never reaches outside the paths it was
+    /// given.
+    #[serde(skip)]
+    pub desktop_sessions_root: Option<PathBuf>,
 }
 
 fn default_lfs_patterns() -> Vec<String> {
@@ -133,6 +149,8 @@ impl Default for FilterConfig {
             warn_each_skipped_file: false,
             merge_tool: String::new(),
             prefer_merge_tool: false,
+            desktop_sessions_dir: None,
+            desktop_sessions_root: None,
         }
     }
 }
@@ -143,7 +161,7 @@ impl FilterConfig {
         let config_path = Self::config_path()?;
 
         if !config_path.exists() {
-            return Ok(Self::default());
+            return Ok(Self::default().with_desktop_sessions_root());
         }
 
         let content = fs::read_to_string(&config_path)
@@ -175,7 +193,18 @@ impl FilterConfig {
             config.max_file_size_bytes = default;
         }
 
-        Ok(config)
+        Ok(config.with_desktop_sessions_root())
+    }
+
+    /// Resolve where the desktop app's session list is on this machine: the
+    /// configured override, else the platform default. Only `load` calls
+    /// this — a config built in code keeps `None` (see the field).
+    fn with_desktop_sessions_root(mut self) -> Self {
+        self.desktop_sessions_root = self
+            .desktop_sessions_dir
+            .clone()
+            .or_else(crate::artifacts::desktop_sessions::default_dir);
+        self
     }
 
     /// Save configuration to file
@@ -315,6 +344,14 @@ impl FilterConfig {
             );
         }
         crate::project_map::validate(&self.project_map)?;
+        if let Some(dir) = &self.desktop_sessions_dir {
+            if !dir.is_absolute() {
+                bail!(
+                    "desktop_sessions_dir must be an absolute path, got '{}'",
+                    dir.display()
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -448,6 +485,39 @@ pub fn set_merge_tool(command: &str) -> Result<()> {
         println!("{}", "Merge tool cleared".green());
     } else {
         println!("{}", format!("Merge tool: {}", config.merge_tool).green());
+    }
+    Ok(())
+}
+
+/// Point the `desktop-sessions` category at the directory the Claude desktop
+/// app keeps its session list in. An empty string restores the platform
+/// default.
+pub fn set_desktop_sessions_dir(path: &str) -> Result<()> {
+    let mut config = FilterConfig::load()?;
+    let path = path.trim();
+    config.desktop_sessions_dir = if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    };
+    config.validate()?;
+    config.save()?;
+
+    match &config.desktop_sessions_dir {
+        Some(dir) => println!(
+            "{}",
+            format!("Desktop app session list: {}", dir.display()).green()
+        ),
+        None => println!(
+            "{}",
+            format!(
+                "Desktop app session list: platform default{}",
+                crate::artifacts::desktop_sessions::default_dir()
+                    .map(|dir| format!(" ({})", dir.display()))
+                    .unwrap_or_default()
+            )
+            .green()
+        ),
     }
     Ok(())
 }
@@ -750,6 +820,21 @@ pub fn show_config() -> Result<()> {
             "Yes (prompts start on merge)".green()
         } else {
             "No".yellow()
+        }
+    );
+
+    println!(
+        "  {}: {}",
+        "Desktop app session list".cyan(),
+        match &config.desktop_sessions_dir {
+            Some(dir) => dir.display().to_string().green(),
+            None => format!(
+                "platform default{}",
+                crate::artifacts::desktop_sessions::default_dir()
+                    .map(|dir| format!(" ({})", dir.display()))
+                    .unwrap_or_default()
+            )
+            .yellow(),
         }
     );
 

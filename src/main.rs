@@ -26,6 +26,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Built once by clap and matched once: the size spread between its
+// variants (`Config` carries every flag) costs nothing worth boxing for.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Initialize a new sync repository
     Init {
@@ -250,6 +253,12 @@ enum Commands {
         /// Start each per-file prompt on `merge` when the merge tool is offered
         #[arg(long, value_name = "BOOL")]
         prefer_merge_tool: Option<bool>,
+
+        /// Where the Claude desktop app keeps its session list
+        /// (`claude-code-sessions/`), for the desktop-sessions category.
+        /// Pass an empty string to go back to the platform default.
+        #[arg(long, value_name = "PATH")]
+        desktop_sessions_dir: Option<String>,
 
         /// Retention window for `purge`, in days (default: the longer of 180
         /// and this machine's Claude Code cleanupPeriodDays)
@@ -669,6 +678,7 @@ fn main() -> Result<()> {
             warn_each_skipped_file,
             merge_tool,
             prefer_merge_tool,
+            desktop_sessions_dir,
             purge_older_than,
             purge_after_sync,
             show,
@@ -695,6 +705,7 @@ fn main() -> Result<()> {
                 || warn_each_skipped_file.is_some()
                 || merge_tool.is_some()
                 || prefer_merge_tool.is_some()
+                || desktop_sessions_dir.is_some()
                 || purge_older_than.is_some()
                 || purge_after_sync.is_some()
                 || show
@@ -727,6 +738,9 @@ fn main() -> Result<()> {
                 }
                 if let Some(prefer) = prefer_merge_tool {
                     filter::set_prefer_merge_tool(prefer)?;
+                }
+                if let Some(dir) = desktop_sessions_dir {
+                    filter::set_desktop_sessions_dir(&dir)?;
                 }
                 if purge_older_than.is_some() || purge_after_sync.is_some() {
                     filter::configure_purge(purge_older_than, purge_after_sync)?;
