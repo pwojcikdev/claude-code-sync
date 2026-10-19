@@ -383,8 +383,8 @@ This repository doubles as a Homebrew tap. The URL is required because the
 repository is not named `homebrew-*`:
 
 ```bash
-brew tap perfectra1n/claude-code-sync https://github.com/perfectra1n/claude-code-sync
-brew install perfectra1n/claude-code-sync/claude-code-sync
+brew tap pwojcikdev/claude-code-sync https://github.com/pwojcikdev/claude-code-sync
+brew install pwojcikdev/claude-code-sync/claude-code-sync
 ```
 
 **To update:** `brew upgrade claude-code-sync`
