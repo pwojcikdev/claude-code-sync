@@ -790,3 +790,125 @@ fn test_sync_keeps_a_clean_held_file_from_overwriting_repo() {
         "B's unrelated new skill reached the repo: {repo_other}"
     );
 }
+
+/// The desktop app's session list rides the real pipeline: an entry pushed
+/// from A lands in B's app directory, `undo pull` takes it away and a pull
+/// brings it back, and a session deleted in the app on A (entry gone,
+/// tombstone written) disappears from B — undoably.
+#[test]
+#[serial]
+fn test_full_pipeline_desktop_sessions_travel_and_delete_undoably() {
+    use claude_code_sync::artifacts::registry::ArtifactToggles;
+
+    let _restore = EnvRestore::capture();
+    let repo = TempDir::new().unwrap();
+    init_git_repo(repo.path());
+
+    let org_account = Path::new("org-1").join("account-1");
+    let desktop_filter = |machine: &Machine| FilterConfig {
+        sync_artifacts: ArtifactToggles {
+            desktop_sessions: true,
+            ..Default::default()
+        },
+        desktop_sessions_dir: Some(machine.home.join("Claude").join("claude-code-sessions")),
+        ..Default::default()
+    };
+
+    // ---- Machine A: one session in the app, pushed ----
+    let machine_a = Machine::new(repo.path());
+    let filter_a = desktop_filter(&machine_a);
+    machine_a.write_filter(&filter_a);
+    let a_account = filter_a
+        .desktop_sessions_dir
+        .clone()
+        .unwrap()
+        .join(&org_account);
+    fs::create_dir_all(&a_account).unwrap();
+    let entry = r#"{"sessionId":"local_s1","cliSessionId":"cli-1","cwd":"/w/app","title":"Shipped from A","createdAt":1,"lastActivityAt":100,"lastFocusedAt":100,"isArchived":false}"#;
+    fs::write(a_account.join("local_s1.json"), entry).unwrap();
+    machine_a.activate();
+    let report = push_history(
+        Some("desktop entry"),
+        false,
+        None,
+        false,
+        false,
+        VerbosityLevel::Quiet,
+        &std::collections::HashSet::new(),
+        &[] as &[String],
+    )
+    .unwrap();
+    assert_eq!(report.artifacts.total_added(), 1);
+    let tracked = git(repo.path(), &["ls-files"]);
+    assert!(
+        tracked.contains("artifacts/desktop-sessions/org-1/account-1/local_s1.json"),
+        "{tracked}"
+    );
+
+    // ---- Machine B: the entry arrives in its app directory ----
+    let machine_b = Machine::new(repo.path());
+    let filter_b = desktop_filter(&machine_b);
+    machine_b.write_filter(&filter_b);
+    let b_account = filter_b
+        .desktop_sessions_dir
+        .clone()
+        .unwrap()
+        .join(&org_account);
+    fs::create_dir_all(&b_account).unwrap();
+    machine_b.activate();
+    pull_history(false, None, false, VerbosityLevel::Quiet, false).unwrap();
+    assert_eq!(
+        fs::read_to_string(b_account.join("local_s1.json")).unwrap(),
+        entry
+    );
+
+    // undo pull removes what it created; the next pull brings it back.
+    claude_code_sync::undo::undo_pull(None, Some(&machine_b.home)).unwrap();
+    assert!(!b_account.join("local_s1.json").exists());
+    pull_history(false, None, false, VerbosityLevel::Quiet, false).unwrap();
+    assert!(b_account.join("local_s1.json").is_file());
+
+    // ---- A deletes the session in the app; B follows, undoably ----
+    machine_a.activate();
+    fs::remove_file(a_account.join("local_s1.json")).unwrap();
+    fs::write(a_account.join("deleted_cli-1"), "1785953402585").unwrap();
+    let report = push_history(
+        Some("deleted in the app"),
+        false,
+        None,
+        false,
+        false,
+        VerbosityLevel::Quiet,
+        &std::collections::HashSet::new(),
+        &[] as &[String],
+    )
+    .unwrap();
+    assert_eq!(report.artifacts.total_added(), 1, "the tombstone");
+    assert_eq!(report.artifacts.total_deleted(), 1, "the entry");
+    let tracked = git(repo.path(), &["ls-files"]);
+    assert!(!tracked.contains("local_s1.json"), "{tracked}");
+    assert!(tracked.contains("artifacts/desktop-sessions/org-1/account-1/deleted_cli-1"));
+
+    machine_b.activate();
+    let report = pull_history(false, None, false, VerbosityLevel::Quiet, false).unwrap();
+    assert_eq!(report.total_deleted(), 1);
+    assert!(!b_account.join("local_s1.json").exists());
+    assert_eq!(
+        fs::read_to_string(b_account.join("deleted_cli-1")).unwrap(),
+        "1785953402585"
+    );
+
+    claude_code_sync::undo::undo_pull(None, Some(&machine_b.home)).unwrap();
+    assert_eq!(
+        fs::read_to_string(b_account.join("local_s1.json")).unwrap(),
+        entry,
+        "undo brings the deleted entry back"
+    );
+    assert!(
+        !b_account.join("deleted_cli-1").exists(),
+        "and takes the created tombstone away"
+    );
+    pull_history(false, None, false, VerbosityLevel::Quiet, false).unwrap();
+    assert!(!b_account.join("local_s1.json").exists());
+    assert!(b_account.join("deleted_cli-1").is_file());
+}
