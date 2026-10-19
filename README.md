@@ -292,7 +292,8 @@ to the sync repository itself settles the same way, with no prompt.
 transcript it stops showing; the tombstone syncs, the entry is removed from
 the repository and from every other machine — snapshotted first, so
 `claude-code-sync undo pull` brings it back — and no machine re-adopts the
-transcript. Tombstones only ever accumulate.
+transcript. Tombstones only ever accumulate. [`purge`](#purging-old-transcripts)
+retires entries the same way when it removes their transcripts.
 
 Entries name the session's working directory, which is stored as `__HOME__`
 like other config paths and, for a [mapped project](#project-map-machines-that-keep-projects-elsewhere),
@@ -350,6 +351,11 @@ transcript with no readable timestamp is never purged. Each removal takes what
 Claude Code keeps beside it — the session's `subagents/` and `tool-results/`
 directories and any superseded or orphaned copies — and lands in the repo as its
 own commit, so `git` still has everything until the history itself is rewritten.
+With the [`desktop-sessions`](#desktop-app-session-list) category on, the desktop
+app's entry for each purged session goes too, here and in the repository, each
+leaving the tombstone the app writes for a deleted session, so other machines drop
+theirs on their next pull and the app never lists a session whose transcript is
+gone.
 
 ### External merge tool
 
