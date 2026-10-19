@@ -6,14 +6,31 @@
 //!
 //! One type owns both directions: whatever `to_machine` renders, `to_repo`
 //! must undo, or two machines rewrite each other's values on every sync.
+//!
+//! A mapped project (see `crate::project_map`) gets a token of its own,
+//! `__PROJECT_<id>__`, for the categories that opt in: a session's working
+//! directory then resolves to wherever that machine keeps the project, not
+//! to the same path under another home.
 
 use std::path::Path;
+
+use crate::project_map::ProjectMap;
 
 /// Stands for this machine's `~`.
 pub const HOME_TOKEN: &str = "__HOME__";
 /// Stands for this machine's `~/.claude`. Tokenized before the home directory,
 /// since it is configurable and may sit outside it.
 pub const CLAUDE_DIR_TOKEN: &str = "__CLAUDE_DIR__";
+/// `__PROJECT_<id>__` stands for the mapped project `<id>`, wherever this
+/// machine keeps it. Tokenized before everything else, since the project
+/// usually sits under the home directory.
+pub const PROJECT_TOKEN_PREFIX: &str = "__PROJECT_";
+const PROJECT_TOKEN_SUFFIX: &str = "__";
+
+/// The token for a mapped project id.
+pub fn project_token(id: &str) -> String {
+    format!("{PROJECT_TOKEN_PREFIX}{id}{PROJECT_TOKEN_SUFFIX}")
+}
 
 /// This machine's absolute locations and their neutral spellings.
 ///
@@ -24,6 +41,10 @@ pub const CLAUDE_DIR_TOKEN: &str = "__CLAUDE_DIR__";
 pub struct PathTokens {
     home: String,
     claude_dir: String,
+    /// Each mapped project's token and its path on this machine, longest
+    /// path first so a project inside another project's tree is matched
+    /// before its parent. Only applied by the `*_with_projects` methods.
+    projects: Vec<(String, String)>,
 }
 
 impl PathTokens {
@@ -40,7 +61,64 @@ impl PathTokens {
         PathTokens {
             home: json_string_contents(home),
             claude_dir: json_string_contents(claude_dir),
+            projects: Vec::new(),
         }
+    }
+
+    /// The same tokens, plus one per mapped project.
+    pub fn with_project_map(mut self, map: &ProjectMap) -> Self {
+        let mut projects: Vec<(String, String)> = map
+            .iter()
+            .map(|(id, path)| {
+                (
+                    project_token(id),
+                    json_string_contents(&path.to_string_lossy()),
+                )
+            })
+            .collect();
+        projects.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        self.projects = projects;
+        self
+    }
+
+    /// Machine bytes -> repo bytes, with mapped projects tokenized first.
+    pub fn to_repo_with_projects(&self, bytes: &[u8]) -> Vec<u8> {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return bytes.to_vec();
+        };
+        let mut text = text.to_string();
+        for (token, path) in &self.projects {
+            text = replace_path(&text, path, token);
+        }
+        self.to_repo(text.as_bytes())
+    }
+
+    /// Repo bytes -> machine bytes, rendering the mapped projects this
+    /// machine knows. A token for a project it has not mapped is left as it
+    /// is, for [`Self::unmapped_project`] to find.
+    pub fn to_machine_with_projects(&self, bytes: &[u8]) -> Vec<u8> {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return bytes.to_vec();
+        };
+        // Longest token first: `__PROJECT_a__` must not eat the head of
+        // `__PROJECT_a__b__`.
+        let mut by_token = self.projects.iter().collect::<Vec<_>>();
+        by_token.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+        let mut text = text.to_string();
+        for (token, path) in by_token {
+            text = text.replace(token, path);
+        }
+        self.to_machine(text.as_bytes())
+    }
+
+    /// The id of a project token still present in rendered bytes — one
+    /// this machine has not mapped. Approximate for an id containing `__`.
+    pub fn unmapped_project(bytes: &[u8]) -> Option<String> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let start = text.find(PROJECT_TOKEN_PREFIX)? + PROJECT_TOKEN_PREFIX.len();
+        let rest = &text[start..];
+        let end = rest.find(PROJECT_TOKEN_SUFFIX).unwrap_or(rest.len());
+        Some(rest[..end].to_string())
     }
 
     /// Machine bytes -> repo bytes. Non-UTF-8 content passes through unchanged.
@@ -139,7 +217,70 @@ mod tests {
         PathTokens {
             home: "/home/user".to_string(),
             claude_dir: "/home/user/.claude".to_string(),
+            projects: Vec::new(),
         }
+    }
+
+    fn mapped(entries: &[(&str, &str)]) -> PathTokens {
+        let map: ProjectMap = entries
+            .iter()
+            .map(|(id, path)| (id.to_string(), std::path::PathBuf::from(path)))
+            .collect();
+        tokens().with_project_map(&map)
+    }
+
+    #[test]
+    fn a_mapped_project_is_tokenized_before_the_home_directory() {
+        let tokens = mapped(&[("app", "/home/user/work/app")]);
+        let live = br#"{"cwd":"/home/user/work/app","planPath":"/home/user/.claude/plans/x.md","other":"/home/user/work/app-renamed"}"#;
+        let stored = String::from_utf8(tokens.to_repo_with_projects(live)).unwrap();
+        assert_eq!(
+            stored,
+            r#"{"cwd":"__PROJECT_app__","planPath":"__CLAUDE_DIR__/plans/x.md","other":"__HOME__/work/app-renamed"}"#
+        );
+        assert_eq!(
+            tokens.to_machine_with_projects(stored.as_bytes()),
+            live.to_vec()
+        );
+        // The plain methods never see the project.
+        assert!(!String::from_utf8(tokens.to_repo(live))
+            .unwrap()
+            .contains("__PROJECT_"));
+    }
+
+    #[test]
+    fn a_project_inside_another_is_matched_first() {
+        let tokens = mapped(&[
+            ("outer", "/home/user/mono"),
+            ("inner", "/home/user/mono/pkg"),
+        ]);
+        let live = br#"{"a":"/home/user/mono/pkg/src","b":"/home/user/mono/docs"}"#;
+        let stored = String::from_utf8(tokens.to_repo_with_projects(live)).unwrap();
+        assert_eq!(
+            stored,
+            r#"{"a":"__PROJECT_inner__/src","b":"__PROJECT_outer__/docs"}"#
+        );
+        assert_eq!(
+            tokens.to_machine_with_projects(stored.as_bytes()),
+            live.to_vec()
+        );
+    }
+
+    #[test]
+    fn a_token_this_machine_has_not_mapped_is_reported() {
+        let tokens = mapped(&[("app", "/home/user/work/app")]);
+        let stored = br#"{"cwd":"__PROJECT_other__/x","b":"__PROJECT_app__"}"#;
+        let rendered = tokens.to_machine_with_projects(stored);
+        assert_eq!(
+            PathTokens::unmapped_project(&rendered),
+            Some("other".to_string())
+        );
+        let rendered = tokens.to_machine_with_projects(br#"{"cwd":"__PROJECT_app__/x"}"#);
+        assert_eq!(PathTokens::unmapped_project(&rendered), None);
+        assert_eq!(
+            PathTokens::unmapped_project(b"__PROJECT_unterminated"),
+            Some("unterminated".to_string())
+        );
     }
 
     #[test]
@@ -193,6 +334,7 @@ mod tests {
         let tokens = PathTokens {
             home: String::new(),
             claude_dir: "/srv/claude".to_string(),
+            projects: Vec::new(),
         };
         let live = b"/home/user/x";
         assert_eq!(tokens.to_repo(live), live.to_vec());
