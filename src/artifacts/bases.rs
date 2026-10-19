@@ -79,6 +79,18 @@ pub fn restore_keys(
     )
 }
 
+/// Every hash the record files, for any sync repository, under paths that
+/// start with `prefix` — what a per-hash store of those files' bytes must
+/// keep (see `super::desktop_sessions::prune_bases`).
+pub fn recorded_hashes_under(claude_dir: &Path, prefix: &str) -> std::collections::HashSet<String> {
+    RepoRecord::<BaseHashes>::read(claude_dir, BASES_FILE_NAME)
+        .entries()
+        .flat_map(|entry| entry.iter())
+        .filter(|(rel, _)| rel.starts_with(prefix))
+        .map(|(_, hash)| hash.clone())
+        .collect()
+}
+
 /// The base value recorded when a mid-pull create-skip could not read
 /// the repo copy: the user's file must read dirty or the next pull
 /// overwrites it. NOT a hash of any bytes — a real hash (even of empty
@@ -298,6 +310,29 @@ mod tests {
         .unwrap();
 
         assert!(load(claude.path(), repo).is_empty());
+    }
+
+    #[test]
+    fn recorded_hashes_under_a_prefix_span_every_repository() {
+        let claude = tempfile::tempdir().unwrap();
+        save(
+            claude.path(),
+            Path::new("/one"),
+            hashes(&[("artifacts/x/a", "aa"), ("artifacts/y/b", "bb")]),
+        )
+        .unwrap();
+        save(
+            claude.path(),
+            Path::new("/two"),
+            hashes(&[("artifacts/x/c", "cc")]),
+        )
+        .unwrap();
+        let under_x = recorded_hashes_under(claude.path(), "artifacts/x/");
+        assert_eq!(
+            under_x,
+            std::collections::HashSet::from(["aa".to_string(), "cc".to_string()])
+        );
+        assert!(recorded_hashes_under(claude.path(), "artifacts/z/").is_empty());
     }
 
     #[test]
