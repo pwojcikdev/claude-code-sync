@@ -24,6 +24,7 @@ cargo doc --open --no-deps --all-features
 |---------|-------------|
 | **Smart Merge** | Automatically combines non-conflicting conversation changes |
 | **Artifact Sync** | Carry settings, skills, agents, commands, rules, hooks, plugin manifests, plans, todos, and prompt history across machines |
+| **Desktop Session List** | The Claude desktop app's Code tab sidebar follows your sessions: entries merge field by field, deletions propagate |
 | **Project Map** | Pin a project to its path per machine, so renamed or relocated checkouts stay one project |
 | **Neutral Paths** | Synced config files store `__HOME__` / `__CLAUDE_DIR__` instead of this machine's absolute paths |
 | **Deletion Mirroring** | Deleting a skill, agent, command, rule or hook propagates, guarded so a fresh machine can never wipe the repo |
@@ -83,6 +84,7 @@ carries the rest of `~/.claude` across machines, per category:
 | `plans` | `~/.claude/plans/` | Plan-mode documents (may contain sensitive prose) |
 | `todos` | `~/.claude/todos/` | Session task lists (churny; consider leaving off) |
 | `prompt-history` | `~/.claude/history.jsonl` | Union-merged in both directions, so machines converge to the superset |
+| `desktop-sessions` | the desktop app's `claude-code-sessions/` | The Code tab's session list: entries and deletion tombstones, merged field by field (see [below](#desktop-app-session-list)) |
 | attachments | non-`.jsonl` files in `~/.claude/projects/` | Images, PDFs, and per-project `memory/` dirs; governed by `--exclude-attachments`, not a toggle |
 
 Enable categories per machine (all default **off** for existing configs; the
@@ -93,7 +95,7 @@ first-run wizard pre-selects them for new setups, except `hooks`):
 claude-code-sync config --enable-artifacts all
 
 # Or pick categories
-claude-code-sync config --enable-artifacts settings,skills,agents,commands,plugins,prompt-history
+claude-code-sync config --enable-artifacts settings,skills,agents,commands,plugins,prompt-history,desktop-sessions
 
 # Turn one off again
 claude-code-sync config --disable-artifacts todos
@@ -139,6 +141,7 @@ block in the repo's `.gitignore` (or `.hgignore`) as defense in depth.
   artifacts/
     settings/  memory/  skills/  agents/  commands/  rules/
     hooks/     plugins/ plans/   todos/   prompt-history/
+    desktop-sessions/<org>/<account>/   # local_<id>.json entries, deleted_<id> tombstones
 ```
 
 ### Conflict policy and undo
@@ -228,7 +231,9 @@ Each machine records which artifact paths it last synced (in
 A file that machine received before and no longer has is a deletion: push
 removes it from the repo, pull removes it locally. This applies to the curated
 directories only — `skills`, `agents`, `commands`, `rules`, `hooks` — never to
-transcripts, attachments, plans, todos or prompt history.
+transcripts, attachments, plans, todos or prompt history. (Desktop session
+entries are deleted through the app's own tombstones instead; see
+[above](#desktop-app-session-list).)
 
 Three guards keep it from destroying anything:
 
@@ -246,6 +251,63 @@ repo has just been rewound underneath it; the next sync re-learns.
 
 Deleted files are snapshotted first, so `claude-code-sync undo pull` brings them
 back, and `pull --interactive` asks before each one.
+
+### Desktop app session list
+
+Synced transcripts alone do not show up in the Claude desktop app: its Code
+tab lists what its own index holds — one `local_<id>.json` per session under
+`claude-code-sessions/<org>/<account>/` in the app's data directory
+(`~/Library/Application Support/Claude` on macOS, `~/.config/Claude` on Linux,
+`%APPDATA%\Claude` on Windows) — and only then finds each transcript by its id
+under `~/.claude/projects/`. The `desktop-sessions` category carries that
+index, so a session started on one machine appears in the sidebar of the
+other once its transcript has synced. Restart the app (or switch accounts) to
+see entries a pull added; it reads the directory when it starts.
+
+Only two kinds of file travel: the entries and the `deleted_<transcript id>`
+tombstones the app writes when you delete a session. The app's backlog,
+archive hint, scheduled tasks and in-flight temp files stay on the machine,
+and a pull refuses anything else under that path in the repository.
+
+The app rewrites an entry every time you open the session, so two machines
+that both used one session always hold two versions. Instead of overwriting
+or holding back, both push and pull **merge field by field**:
+
+| Field | Rule |
+|---|---|
+| `lastActivityAt`, `lastFocusedAt`, `completedTurns`, ... | the later value |
+| `createdAt` | the earlier value |
+| id lists (`priorCliSessionIds`, `writtenBranches`, `prs`, ...) | the union; with a base, what either side removed stays removed |
+| `enabledMcpTools` and other maps | merged key by key with the same rules |
+| connector and prompt caches (`remoteMcpServersConfig`, ...) | this machine's copy |
+| everything else (`title`, `isArchived`, `model`, ...) | three-way: the side that changed it since the last sync; if both did, the side with the later activity |
+
+The three-way needs the version both machines started from, which each
+machine keeps in `~/.claude/.claude-code-sync-desktop-bases/` (never synced,
+pruned as entries move on). Without it the merge is two-way, and the side with
+the later activity wins a field both changed. A file both machines committed
+to the sync repository itself settles the same way, with no prompt.
+
+**Deleting a session propagates.** The app leaves a tombstone for the
+transcript it stops showing; the tombstone syncs, the entry is removed from
+the repository and from every other machine — snapshotted first, so
+`claude-code-sync undo pull` brings it back — and no machine re-adopts the
+transcript. Tombstones only ever accumulate.
+
+Entries name the session's working directory, which is stored as `__HOME__`
+like other config paths and, for a [mapped project](#project-map-machines-that-keep-projects-elsewhere),
+as `__PROJECT_<id>__` — so it resolves to wherever each machine keeps the
+project. A machine that has not mapped that project skips those entries, the
+way it skips the project's transcripts, and names the project once.
+
+A machine where the app has never run has no `claude-code-sessions/`
+directory, and the category does nothing there. If the app keeps its data
+somewhere else, point the category at it:
+
+```bash
+claude-code-sync config --desktop-sessions-dir "/path/to/Claude/claude-code-sessions"
+claude-code-sync config --desktop-sessions-dir ""   # back to the platform default
+```
 
 ### Memory indexes merge instead of overwriting
 
