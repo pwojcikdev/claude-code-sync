@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-REPO="perfectra1n/claude-code-sync"
+REPO="pwojcikdev/claude-code-sync"
 tag="${1:?usage: $0 <tag, e.g. v0.3.3>}"
 [[ "$tag" == v* ]] || tag="v$tag"
 version="${tag#v}"

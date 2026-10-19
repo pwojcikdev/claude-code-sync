@@ -1,7 +1,7 @@
 #!/bin/sh
 # claude-code-sync installer for Linux and macOS.
 #
-#   curl -fsSL https://raw.githubusercontent.com/perfectra1n/claude-code-sync/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/pwojcikdev/claude-code-sync/main/install.sh | sh
 #
 # Pass options after `sh -s --`, e.g. `... | sh -s -- --version v0.3.3 --dir /usr/local/bin`.
 # Every option also has an environment variable, which the flag overrides.
@@ -15,7 +15,7 @@
 
 set -eu
 
-REPO="perfectra1n/claude-code-sync"
+REPO="pwojcikdev/claude-code-sync"
 BIN="claude-code-sync"
 
 say() { printf '%s\n' "$*"; }
