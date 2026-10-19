@@ -6,12 +6,20 @@
 //!
 //! The window is never shorter than `cleanupPeriodDays`, which is when Claude
 //! Code deletes the transcript anyway, nor shorter than six months.
+//!
+//! The desktop app's session entries that point at a purged transcript go
+//! with it, each leaving the tombstone the app itself writes for a deleted
+//! session (see `crate::artifacts::desktop_sessions`), so no machine keeps
+//! listing the session or re-adopts the transcript.
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rayon::prelude::*;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use crate::artifacts::desktop_sessions;
 
 /// Shortest retention window applied by default: six months.
 pub const MINIMUM_RETENTION_DAYS: u32 = 180;
@@ -31,12 +39,27 @@ pub struct PurgeTarget {
     pub bytes: u64,
 }
 
+/// One desktop app session entry a purge retires with its transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopEntry {
+    /// The entry file, on this machine or in the sync repository.
+    pub path: PathBuf,
+    /// The purged transcript it points at: what its tombstone names.
+    pub transcript_id: String,
+    /// The entry's repo-relative path when it is the repository's copy, for
+    /// the records that file it under that key.
+    pub repo_rel: Option<String>,
+}
+
 /// What a purge would remove, computed before anything is deleted.
 #[derive(Debug, Default)]
 pub struct PurgePlan {
     pub retention_days: u32,
     pub cutoff: Option<DateTime<Utc>>,
     pub targets: Vec<PurgeTarget>,
+    /// Desktop app session entries — this machine's and the repository's —
+    /// that point at a purged transcript (see [`retire_desktop_entries`]).
+    pub desktop_entries: Vec<DesktopEntry>,
     /// Sessions kept because at least one copy has no readable age.
     pub undated: usize,
     /// Transcript files that failed to parse, such as one being written right
@@ -65,6 +88,8 @@ pub struct PurgeReport {
     pub sessions: usize,
     pub files: usize,
     pub bytes: u64,
+    /// Desktop app session entries removed, each with a tombstone written.
+    pub desktop_entries: usize,
     /// Paths that could not be removed, with the reason.
     pub failures: Vec<String>,
 }
@@ -211,10 +236,92 @@ pub fn plan(
     Ok(plan)
 }
 
+/// Add to the plan every desktop app session entry — on this machine under
+/// `local_root`, when the app's directory is there, and the repository's —
+/// that points at a transcript the plan removes. Applying the plan then
+/// removes each and writes the tombstone beside it, the way the app retires
+/// a deleted session: the next sync drops the entry from every other
+/// machine, and none re-adopts the transcript.
+pub fn retire_desktop_entries(plan: &mut PurgePlan, local_root: Option<&Path>, repo_root: &Path) {
+    let ids: HashSet<String> = plan
+        .targets
+        .iter()
+        .map(|target| target.session_id.clone())
+        .collect();
+    let mut entries = Vec::new();
+    if let Some(root) = local_root {
+        for (path, transcript_id) in desktop_sessions::entries_for_transcripts(root, &ids) {
+            entries.push(DesktopEntry {
+                path,
+                transcript_id,
+                repo_rel: None,
+            });
+        }
+    }
+    let category_root = desktop_sessions::repo_category_root(repo_root);
+    for (path, transcript_id) in desktop_sessions::entries_for_transcripts(&category_root, &ids) {
+        let repo_rel = path
+            .strip_prefix(repo_root)
+            .ok()
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"));
+        entries.push(DesktopEntry {
+            path,
+            transcript_id,
+            repo_rel,
+        });
+    }
+    plan.desktop_entries = entries;
+}
+
+/// Drop the per-machine record entries (last-synced base, tracked path) of
+/// the repository entries the plan retires: they describe files that exist
+/// nowhere any more, and nothing later prunes them.
+pub fn forget_desktop_records(claude_dir: &Path, repo_root: &Path, plan: &PurgePlan) -> Result<()> {
+    let removals: Vec<String> = plan
+        .desktop_entries
+        .iter()
+        .filter_map(|entry| entry.repo_rel.clone())
+        .collect();
+    if removals.is_empty() {
+        return Ok(());
+    }
+    crate::artifacts::bases::save_delta(
+        claude_dir,
+        repo_root,
+        Default::default(),
+        removals.clone(),
+    )?;
+    crate::artifacts::tracked::save_delta(claude_dir, repo_root, Default::default(), removals)
+}
+
 /// Delete everything the plan names. A path that is already gone is skipped,
 /// not an error.
 pub fn apply(plan: &PurgePlan) -> Result<PurgeReport> {
     let mut report = PurgeReport::default();
+    let now_ms = Utc::now().timestamp_millis();
+
+    for entry in &plan.desktop_entries {
+        match std::fs::remove_file(&entry.path) {
+            Ok(()) => report.desktop_entries += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                report
+                    .failures
+                    .push(format!("{}: {error}", entry.path.display()));
+                continue;
+            }
+        }
+        // The tombstone the app would have written: epoch milliseconds, and
+        // an existing one (an earlier deletion) is left as it is.
+        let tombstone = desktop_sessions::tombstone_beside(&entry.path, &entry.transcript_id);
+        if !tombstone.exists() {
+            if let Err(error) = std::fs::write(&tombstone, now_ms.to_string()) {
+                report
+                    .failures
+                    .push(format!("{}: {error}", tombstone.display()));
+            }
+        }
+    }
 
     for target in &plan.targets {
         report.sessions += 1;

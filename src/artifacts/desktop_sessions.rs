@@ -33,6 +33,11 @@ use crate::scm::{ConflictChoice, ConflictedFile};
 /// Subdirectory of the sync repository's `artifacts/` root.
 pub const REPO_SUBDIR: &str = "desktop-sessions";
 
+/// The repository's root for this category.
+pub fn repo_category_root(repo_root: &Path) -> PathBuf {
+    repo_root.join(ARTIFACTS_SUBDIR).join(REPO_SUBDIR)
+}
+
 /// A session entry: `local_<id>.json`.
 const INDEX_PREFIX: &str = "local_";
 const INDEX_SUFFIX: &str = ".json";
@@ -143,6 +148,41 @@ pub fn tombstoned_ids(root: &Path) -> HashSet<String> {
         }
     }
     ids
+}
+
+/// Every entry under `root` (the app's directory or the repository's
+/// category root) whose transcript is one of `ids`, with that id — what a
+/// purge of those transcripts retires.
+pub fn entries_for_transcripts(root: &Path, ids: &HashSet<String>) -> Vec<(PathBuf, String)> {
+    if ids.is_empty() || !root.is_dir() {
+        return Vec::new();
+    }
+    walkdir::WalkDir::new(root)
+        .min_depth(3)
+        .max_depth(3)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let path = entry.path().to_path_buf();
+            let rel = path.strip_prefix(root).ok()?;
+            if !is_syncable_rel(rel) || !is_index_path(rel) {
+                return None;
+            }
+            let id = cli_session_id(&fs::read(&path).ok()?)?;
+            ids.contains(&id).then_some((path, id))
+        })
+        .collect()
+}
+
+/// Where the tombstone for `transcript_id` goes: beside the entry, in its
+/// account directory, as the app writes it.
+pub fn tombstone_beside(entry: &Path, transcript_id: &str) -> PathBuf {
+    entry
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join(format!("{TOMBSTONE_PREFIX}{transcript_id}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +556,47 @@ mod tests {
         let ids = tombstoned_ids(root.path());
         assert_eq!(ids, HashSet::from(["one".to_string(), "two".to_string()]));
         assert!(tombstoned_ids(Path::new("/nonexistent")).is_empty());
+    }
+
+    #[test]
+    fn entries_for_transcripts_finds_matching_entries_two_levels_down() {
+        let root = tempfile::tempdir().unwrap();
+        let account = root.path().join("org").join("account");
+        fs::create_dir_all(&account).unwrap();
+        let old = account.join("local_old.json");
+        fs::write(&old, r#"{"cliSessionId":"cli-old"}"#).unwrap();
+        fs::write(
+            account.join("local_recent.json"),
+            r#"{"cliSessionId":"cli-recent"}"#,
+        )
+        .unwrap();
+        fs::write(account.join("local_broken.json"), "{ not json").unwrap();
+        fs::write(
+            account.join("local_old.json.tmp"),
+            r#"{"cliSessionId":"cli-old"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("local_shallow.json"),
+            r#"{"cliSessionId":"cli-old"}"#,
+        )
+        .unwrap();
+
+        let ids = HashSet::from(["cli-old".to_string(), "cli-missing".to_string()]);
+        assert_eq!(
+            entries_for_transcripts(root.path(), &ids),
+            vec![(old.clone(), "cli-old".to_string())]
+        );
+        assert!(entries_for_transcripts(root.path(), &HashSet::new()).is_empty());
+        assert!(entries_for_transcripts(Path::new("/nonexistent"), &ids).is_empty());
+        assert_eq!(
+            tombstone_beside(&old, "cli-old"),
+            account.join("deleted_cli-old")
+        );
+        assert_eq!(
+            repo_category_root(Path::new("/repo")),
+            Path::new("/repo/artifacts/desktop-sessions")
+        );
     }
 
     #[test]
