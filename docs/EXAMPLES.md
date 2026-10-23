@@ -562,7 +562,7 @@ jobs:
 
       - name: Install claude-code-sync
         run: |
-          curl -fsSL https://raw.githubusercontent.com/perfectra1n/claude-code-sync/main/install.sh | sh
+          curl -fsSL https://raw.githubusercontent.com/pwojcikdev/claude-code-sync/main/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Create init config

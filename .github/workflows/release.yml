@@ -150,7 +150,11 @@ jobs:
   publish-crate:
     name: Publish to crates.io
     needs: [release-please, build-binaries]
-    if: needs.release-please.outputs.release_created == 'true'
+    # The `claude-code-sync` crate on crates.io belongs to the upstream
+    # repository, so this fork skips publishing unless the PUBLISH_CRATE
+    # repository variable is "true" (after renaming the crate and adding a
+    # CRATES_IO_TOKEN secret).
+    if: needs.release-please.outputs.release_created == 'true' && vars.PUBLISH_CRATE == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout release tag

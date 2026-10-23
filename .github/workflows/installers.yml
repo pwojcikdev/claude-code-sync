@@ -62,7 +62,7 @@ jobs:
         id: avail
         run: |
           if [ -z "${{ matrix.asset }}" ] || curl -fsIL -o /dev/null \
-              "https://github.com/perfectra1n/claude-code-sync/releases/latest/download/${{ matrix.asset }}"; then
+              "https://github.com/pwojcikdev/claude-code-sync/releases/latest/download/${{ matrix.asset }}"; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::Latest release has no ${{ matrix.asset }} yet; skipping"
@@ -137,9 +137,9 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
-          brew tap perfectra1n/claude-code-sync "$GITHUB_WORKSPACE"
-          brew install perfectra1n/claude-code-sync/claude-code-sync
-          brew test perfectra1n/claude-code-sync/claude-code-sync
+          brew tap pwojcikdev/claude-code-sync "$GITHUB_WORKSPACE"
+          brew install pwojcikdev/claude-code-sync/claude-code-sync
+          brew test pwojcikdev/claude-code-sync/claude-code-sync
           claude-code-sync --version
 
   scoop:

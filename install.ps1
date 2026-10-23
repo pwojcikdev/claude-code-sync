@@ -1,6 +1,6 @@
 # claude-code-sync installer for Windows.
 #
-#   irm https://raw.githubusercontent.com/perfectra1n/claude-code-sync/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/pwojcikdev/claude-code-sync/main/install.ps1 | iex
 #
 # `irm | iex` cannot take arguments, so options are environment variables:
 #
@@ -25,7 +25,7 @@ function Install-ClaudeCodeSync {
     # Windows PowerShell 5.1 defaults to TLS 1.0, which GitHub rejects.
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-    $repo = 'perfectra1n/claude-code-sync'
+    $repo = 'pwojcikdev/claude-code-sync'
     $bin = 'claude-code-sync.exe'
 
     # OSArchitecture reports the real hardware even from an emulated x64 PowerShell on ARM64.

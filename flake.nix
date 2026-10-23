@@ -2,8 +2,8 @@
   description = "Sync Claude Code conversation history with git repositories";
 
   # Usage:
-  #   nix run github:perfectra1n/claude-code-sync -- --help
-  #   nix profile install github:perfectra1n/claude-code-sync
+  #   nix run github:pwojcikdev/claude-code-sync -- --help
+  #   nix profile install github:pwojcikdev/claude-code-sync
   # or add this flake as an input and use `packages.<system>.default`.
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
