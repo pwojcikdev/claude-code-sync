@@ -1,16 +1,16 @@
 {
   "version": "0.4.1",
   "description": "Sync Claude Code conversation history with git repositories",
-  "homepage": "https://github.com/perfectra1n/claude-code-sync",
+  "homepage": "https://github.com/pwojcikdev/claude-code-sync",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/perfectra1n/claude-code-sync/releases/download/v0.4.1/claude-code-sync-windows-x86_64.exe.zip",
-      "hash": "dc1e20ab983f29892b1c5daca6717ffec892d10565b60dca8c624a2b95a7a1f9"
+      "url": "https://github.com/pwojcikdev/claude-code-sync/releases/download/v0.4.1/claude-code-sync-windows-x86_64.exe.zip",
+      "hash": "afed2a9eba0f04537f208bc67996a86aad9390e45d8ac19cfa61835729bc88a0"
     },
     "arm64": {
-      "url": "https://github.com/perfectra1n/claude-code-sync/releases/download/v0.4.1/claude-code-sync-windows-aarch64.exe.zip",
-      "hash": "bd7541a7512ddbd041c9b8fa5fda34bc5572d1e6478295c986ec18c131e4701f"
+      "url": "https://github.com/pwojcikdev/claude-code-sync/releases/download/v0.4.1/claude-code-sync-windows-aarch64.exe.zip",
+      "hash": "ac5152193e3e3f2b562851433487a3313abc19d9b34a7ed667114cced17b2e06"
     }
   },
   "bin": "claude-code-sync.exe",
@@ -18,13 +18,13 @@
   "autoupdate": {
     "architecture": {
       "64bit": {
-        "url": "https://github.com/perfectra1n/claude-code-sync/releases/download/v$version/claude-code-sync-windows-x86_64.exe.zip",
+        "url": "https://github.com/pwojcikdev/claude-code-sync/releases/download/v$version/claude-code-sync-windows-x86_64.exe.zip",
         "hash": {
           "url": "$url.sha256"
         }
       },
       "arm64": {
-        "url": "https://github.com/perfectra1n/claude-code-sync/releases/download/v$version/claude-code-sync-windows-aarch64.exe.zip",
+        "url": "https://github.com/pwojcikdev/claude-code-sync/releases/download/v$version/claude-code-sync-windows-aarch64.exe.zip",
         "hash": {
           "url": "$url.sha256"
         }
