@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/pwojcikdev/claude-code-sync/compare/v0.4.1...v0.5.0) (2026-10-24)
+
+
+### Features
+
+* sync the Claude desktop app's session list ([5469f2e](https://github.com/pwojcikdev/claude-code-sync/commit/5469f2e0503372fc708f7b4e8759b47163fb144d))
+
 ## [0.4.1](https://github.com/perfectra1n/claude-code-sync/compare/v0.4.0...v0.4.1) (2026-10-10)
 
 
