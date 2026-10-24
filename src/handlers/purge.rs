@@ -21,11 +21,12 @@ pub fn handle_purge(older_than_days: Option<u32>, dry_run: bool, assume_yes: boo
     let configured = older_than_days.or(filter.purge_older_than_days);
     let days = purge::retention_days(&claude_dir, configured);
 
-    let plan = purge::plan(
+    let mut plan = purge::plan(
         &claude_projects_dir()?,
         &state.sync_repo_path.join(&filter.sync_subdirectory),
         days,
     )?;
+    retire_desktop_entries(&mut plan, &filter, &state.sync_repo_path);
 
     describe(&plan);
     if plan.is_empty() || dry_run {
@@ -43,6 +44,7 @@ pub fn handle_purge(older_than_days: Option<u32>, dry_run: bool, assume_yes: boo
     purge::ensure_nothing_uncommitted(repo.as_ref())?;
 
     let report = purge::apply(&plan)?;
+    forget_desktop_records(&claude_dir, &state.sync_repo_path, &plan);
     let committed = purge::commit_removals(repo.as_ref(), &plan);
     report_outcome(&report, matches!(committed, Ok(true)));
     committed?;
@@ -58,7 +60,7 @@ pub fn purge_after_sync(filter: &FilterConfig, repo_root: &Path) -> Result<()> {
     }
     let claude_dir = crate::sync::discovery::claude_home_dir()?;
     let days = purge::retention_days(&claude_dir, filter.purge_older_than_days);
-    let plan = purge::plan(
+    let mut plan = purge::plan(
         &claude_projects_dir()?,
         &repo_root.join(&filter.sync_subdirectory),
         days,
@@ -66,6 +68,7 @@ pub fn purge_after_sync(filter: &FilterConfig, repo_root: &Path) -> Result<()> {
     if plan.is_empty() {
         return Ok(());
     }
+    retire_desktop_entries(&mut plan, filter, repo_root);
 
     let repo = purge::open_sync_repo(repo_root)?;
     purge::ensure_nothing_uncommitted(repo.as_ref())?;
@@ -77,8 +80,30 @@ pub fn purge_after_sync(filter: &FilterConfig, repo_root: &Path) -> Result<()> {
         plan.retention_days
     );
     let report = purge::apply(&plan)?;
+    forget_desktop_records(&claude_dir, repo_root, &plan);
     report_outcome(&report, false);
     Ok(())
+}
+
+/// The desktop app's entries for the purged sessions go with them when the
+/// `desktop-sessions` category is on — the toggle is the consent to touch
+/// the app's directory — and the app has run on this machine.
+fn retire_desktop_entries(plan: &mut PurgePlan, filter: &FilterConfig, repo_root: &Path) {
+    if !filter.sync_artifacts.desktop_sessions {
+        return;
+    }
+    let local = crate::artifacts::desktop_sessions::dir(filter).filter(|dir| dir.is_dir());
+    purge::retire_desktop_entries(plan, local.as_deref(), repo_root);
+}
+
+/// Never fatal: the files are gone either way, and a stale record entry
+/// costs nothing but a line in a file.
+fn forget_desktop_records(claude_dir: &Path, repo_root: &Path, plan: &PurgePlan) {
+    if let Err(error) = purge::forget_desktop_records(claude_dir, repo_root, plan) {
+        log::warn!(
+            "Record entries of the retired desktop session entries were not dropped: {error}"
+        );
+    }
 }
 
 fn describe(plan: &PurgePlan) {
@@ -132,6 +157,13 @@ fn describe(plan: &PurgePlan) {
     if plan.targets.len() > 10 {
         println!("    {} and {} more", "-".dimmed(), plan.targets.len() - 10);
     }
+    if !plan.desktop_entries.is_empty() {
+        println!(
+            "  {} {} desktop app session entries go with them, each leaving a tombstone",
+            "•".cyan(),
+            plan.desktop_entries.len()
+        );
+    }
     println!(
         "  {}",
         "Deleted from this machine AND from the sync repository (git history keeps them)".dimmed()
@@ -168,6 +200,16 @@ fn report_outcome(report: &PurgeReport, committed: bool) {
         report.files,
         report.bytes as f64 / (1024.0 * 1024.0)
     );
+    if report.desktop_entries > 0 {
+        println!(
+            "    {}",
+            format!(
+                "{} desktop app session entries retired with them",
+                report.desktop_entries
+            )
+            .dimmed()
+        );
+    }
     if committed {
         println!(
             "    {}",

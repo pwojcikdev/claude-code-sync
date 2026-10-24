@@ -1,6 +1,7 @@
 //! Artifact sync: carries Claude Code state beyond conversation history
 //! (settings, skills, agents, commands, rules, hooks, plugin manifests, plans,
-//! todos, prompt history) between `~/.claude` and the sync repository.
+//! todos, prompt history, the desktop app's session list) between `~/.claude`
+//! and the sync repository.
 //!
 //! Sessions keep their dedicated pipeline in `crate::sync`; this module owns
 //! everything category-shaped. Adding a category = one registry row plus one
@@ -8,6 +9,7 @@
 
 pub mod bases;
 pub mod denylist;
+pub mod desktop_sessions;
 pub mod engine;
 pub mod memory_index;
 pub mod registry;

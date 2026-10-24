@@ -23,6 +23,10 @@ pub enum CategoryId {
     /// memory). Gated by `!exclude_attachments` instead of a toggle, honoring
     /// the long-documented attachments contract.
     ProjectAttachments,
+    /// The Claude desktop app's session list (its Code tab sidebar): one
+    /// entry per session plus deletion tombstones, kept outside `~/.claude`
+    /// in the app's own data directory.
+    DesktopSessions,
 }
 
 /// What to copy, relative to `~/.claude`. Missing sources are treated as
@@ -34,6 +38,10 @@ pub enum SourceSpec {
     Files(&'static [&'static str]),
     /// A directory walked recursively (symlinks not followed).
     Dir(&'static str),
+    /// The desktop app's `claude-code-sessions/` directory, outside
+    /// `~/.claude` (see `super::desktop_sessions::dir`): only its
+    /// `<org>/<account>/local_*.json` entries and `deleted_*` tombstones.
+    DesktopSessions,
 }
 
 /// How pull reconciles a repo copy with the local file.
@@ -48,6 +56,12 @@ pub enum MergeStrategy {
     /// every other file in the category raw-overwrites. Overwriting an index
     /// with a sparser one orphans the other machine's memory files.
     UnionMemoryIndex,
+    /// Desktop session entries: remote wins when only the other machine
+    /// changed one, and a file both machines changed is merged field by
+    /// field (see `super::desktop_sessions`) instead of held back — the
+    /// app rewrites every entry it opens, so holding back would never
+    /// settle. Tombstones keep the later deletion time.
+    SessionIndex,
 }
 
 /// Where a category's files live inside the sync repository.
@@ -78,6 +92,11 @@ pub struct CategoryDescriptor {
     /// Rewrite this machine's absolute paths to tokens into the repo and back
     /// out. For config files that embed paths; user content is stored verbatim.
     pub tokenize_paths: bool,
+    /// Also tokenize mapped projects (`__PROJECT_<id>__`), so a path into a
+    /// project resolves to wherever each machine keeps it. A file naming a
+    /// project this machine has not mapped is skipped on pull, like the
+    /// project's transcripts are.
+    pub tokenize_projects: bool,
     /// Propagate deletions: a file this machine synced before and no longer has
     /// is removed from the other side. Only for curated directories.
     pub mirror_deletes: bool,
@@ -100,6 +119,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: true,
+        tokenize_projects: false,
         mirror_deletes: false,
         description: "User settings and keybindings (never settings.local.json)",
     },
@@ -112,6 +132,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: false,
         description: "Global CLAUDE.md user memory",
     },
@@ -124,6 +145,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: true,
         description: "Custom skills",
     },
@@ -136,6 +158,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: true,
         description: "Custom subagent definitions",
     },
@@ -148,6 +171,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: true,
         description: "Custom slash commands",
     },
@@ -160,6 +184,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: true,
         description: "Shared rule files projects import from ~/.claude/rules",
     },
@@ -172,6 +197,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: true,
         description: "Hook scripts settings.json points at (they run automatically)",
     },
@@ -187,6 +213,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: true,
+        tokenize_projects: false,
         mirror_deletes: false,
         description: "Installed-plugin and marketplace manifests (never plugin caches)",
     },
@@ -199,6 +226,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: false,
         description: "Plan-mode documents (may contain sensitive prose)",
     },
@@ -211,6 +239,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: false,
         description: "Session task lists (changes frequently)",
     },
@@ -223,6 +252,7 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::SessionTree,
         exclude_extensions: &["jsonl"],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: false,
         description: "Non-transcript files in project dirs (images, PDFs, project memory)",
     },
@@ -235,8 +265,22 @@ pub static REGISTRY: &[CategoryDescriptor] = &[
         dest: DestRoot::Artifacts,
         exclude_extensions: &[],
         tokenize_paths: false,
+        tokenize_projects: false,
         mirror_deletes: false,
         description: "Cross-project prompt history (union-merged, grow-only)",
+    },
+    CategoryDescriptor {
+        id: CategoryId::DesktopSessions,
+        name: "desktop-sessions",
+        repo_subdir: "desktop-sessions",
+        source: SourceSpec::DesktopSessions,
+        merge: MergeStrategy::SessionIndex,
+        dest: DestRoot::Artifacts,
+        exclude_extensions: &[],
+        tokenize_paths: true,
+        tokenize_projects: true,
+        mirror_deletes: false,
+        description: "Claude desktop app session list (sidebar entries and deletions)",
     },
 ];
 
@@ -267,6 +311,8 @@ pub struct ArtifactToggles {
     pub todos: bool,
     #[serde(default)]
     pub prompt_history: bool,
+    #[serde(default)]
+    pub desktop_sessions: bool,
 }
 
 impl ArtifactToggles {
@@ -284,6 +330,7 @@ impl ArtifactToggles {
             plans: true,
             todos: true,
             prompt_history: true,
+            desktop_sessions: true,
         }
     }
 
@@ -316,6 +363,7 @@ impl ArtifactToggles {
             CategoryId::Plans => self.plans,
             CategoryId::Todos => self.todos,
             CategoryId::PromptHistory => self.prompt_history,
+            CategoryId::DesktopSessions => self.desktop_sessions,
             // Attachments are gated by FilterConfig::exclude_attachments, not
             // by a toggle; as a toggle they always read as off.
             CategoryId::ProjectAttachments => false,
@@ -336,6 +384,7 @@ impl ArtifactToggles {
             CategoryId::Plans => self.plans = value,
             CategoryId::Todos => self.todos = value,
             CategoryId::PromptHistory => self.prompt_history = value,
+            CategoryId::DesktopSessions => self.desktop_sessions = value,
             CategoryId::ProjectAttachments => {}
         }
     }
@@ -369,10 +418,10 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn test_registry_has_all_twelve_categories() {
-        assert_eq!(REGISTRY.len(), 12);
+    fn test_registry_has_all_thirteen_categories() {
+        assert_eq!(REGISTRY.len(), 13);
         let ids: HashSet<_> = REGISTRY.iter().map(|d| d.id).collect();
-        assert_eq!(ids.len(), 12, "every category appears exactly once");
+        assert_eq!(ids.len(), 13, "every category appears exactly once");
     }
 
     #[test]
@@ -412,11 +461,13 @@ mod tests {
         assert_eq!(ph.merge, MergeStrategy::UnionJsonl);
         assert_eq!(ph.source, SourceSpec::Files(&["history.jsonl"]));
         // Only project attachments, which carry per-project MEMORY.md indexes,
-        // merge as well; everything else raw-overwrites.
-        for d in REGISTRY
-            .iter()
-            .filter(|d| d.id != CategoryId::PromptHistory && d.id != CategoryId::ProjectAttachments)
-        {
+        // and the desktop session list merge as well; everything else
+        // raw-overwrites.
+        for d in REGISTRY.iter().filter(|d| {
+            d.id != CategoryId::PromptHistory
+                && d.id != CategoryId::ProjectAttachments
+                && d.id != CategoryId::DesktopSessions
+        }) {
             assert_eq!(d.merge, MergeStrategy::RawOverwrite, "{}", d.name);
         }
         let attachments = REGISTRY
@@ -424,6 +475,16 @@ mod tests {
             .find(|d| d.id == CategoryId::ProjectAttachments)
             .unwrap();
         assert_eq!(attachments.merge, MergeStrategy::UnionMemoryIndex);
+        let desktop = REGISTRY
+            .iter()
+            .find(|d| d.id == CategoryId::DesktopSessions)
+            .unwrap();
+        assert_eq!(desktop.merge, MergeStrategy::SessionIndex);
+        assert_eq!(desktop.source, SourceSpec::DesktopSessions);
+        assert!(
+            !desktop.mirror_deletes,
+            "deletions travel as the app's own tombstones, not through the tracked record"
+        );
     }
 
     #[test]
@@ -460,7 +521,23 @@ mod tests {
             .filter(|d| d.tokenize_paths)
             .map(|d| d.name)
             .collect();
-        assert_eq!(tokenized, HashSet::from(["settings", "plugins"]));
+        assert_eq!(
+            tokenized,
+            HashSet::from(["settings", "plugins", "desktop-sessions"])
+        );
+        let project_tokenized: HashSet<_> = REGISTRY
+            .iter()
+            .filter(|d| d.tokenize_projects)
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(project_tokenized, HashSet::from(["desktop-sessions"]));
+        for d in REGISTRY.iter().filter(|d| d.tokenize_projects) {
+            assert!(
+                d.tokenize_paths,
+                "{} tokenizes projects, so paths too",
+                d.name
+            );
+        }
     }
 
     #[test]

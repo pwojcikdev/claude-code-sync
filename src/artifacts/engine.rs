@@ -14,6 +14,7 @@ use crate::scm::Backend;
 
 use super::bases::{self, BaseHashes};
 use super::denylist::{is_denied, is_unsafe_rel_path};
+use super::desktop_sessions;
 use super::memory_index::{is_memory_index, merge_memory_index};
 use super::registry::{
     CategoryDescriptor, CategoryId, DestRoot, MergeStrategy, SourceSpec, ARTIFACTS_SUBDIR, REGISTRY,
@@ -56,6 +57,7 @@ pub(crate) fn records_base(strategy: MergeStrategy, _rel: &Path) -> bool {
         MergeStrategy::RawOverwrite => true,
         MergeStrategy::UnionJsonl => false,
         MergeStrategy::UnionMemoryIndex => true,
+        MergeStrategy::SessionIndex => true,
     }
 }
 
@@ -515,9 +517,158 @@ fn collect(
                 });
             }
         }
+        SourceSpec::DesktopSessions => {
+            let Some(base) = desktop_sessions::dir(filter) else {
+                return Ok(files);
+            };
+            if !base.is_dir() {
+                return Ok(files);
+            }
+            // Exactly `<org>/<account>/<file>`: the app keeps other things
+            // beside the entries (a backlog, hints, in-flight temp files)
+            // that stay on the machine.
+            for entry in walkdir::WalkDir::new(&base)
+                .min_depth(3)
+                .max_depth(3)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let abs = entry.path();
+                let rel = abs.strip_prefix(&base).unwrap_or(abs).to_path_buf();
+                if !desktop_sessions::is_syncable_rel(&rel) {
+                    continue;
+                }
+                if is_denied(&rel) {
+                    *skipped += 1;
+                    continue;
+                }
+                if outside_size_limit(abs, filter) {
+                    log::warn!("Skipping {} (exceeds max_file_size_bytes)", abs.display());
+                    *skipped += 1;
+                    held_back.push(rel);
+                    continue;
+                }
+                files.push(CollectedFile {
+                    abs: abs.to_path_buf(),
+                    rel,
+                });
+            }
+        }
     }
 
     Ok(files)
+}
+
+/// Machine bytes -> repo bytes for one category: paths tokenized for the
+/// config categories, mapped projects as well where the category opts in,
+/// verbatim otherwise. The inverse of [`render_machine`].
+fn repo_form(desc: &CategoryDescriptor, tokens: &PathTokens, bytes: &[u8]) -> Vec<u8> {
+    if desc.tokenize_projects {
+        tokens.to_repo_with_projects(bytes)
+    } else if desc.tokenize_paths {
+        tokens.to_repo(bytes)
+    } else {
+        bytes.to_vec()
+    }
+}
+
+/// Repo bytes -> machine bytes for one category (see [`repo_form`]).
+fn render_machine(desc: &CategoryDescriptor, tokens: &PathTokens, bytes: &[u8]) -> Vec<u8> {
+    if desc.tokenize_projects {
+        tokens.to_machine_with_projects(bytes)
+    } else if desc.tokenize_paths {
+        tokens.to_machine(bytes)
+    } else {
+        bytes.to_vec()
+    }
+}
+
+/// Keep the bytes of a desktop session entry as a future merge base (see
+/// `desktop_sessions::store_base`). Never fatal: without it the next merge
+/// of that entry falls back to two-way.
+fn keep_merge_base(claude_dir: &Path, bytes: &[u8]) {
+    if let Err(e) = desktop_sessions::store_base(claude_dir, bytes) {
+        log::warn!("Could not keep a merge base for a desktop session entry: {e}");
+    }
+}
+
+/// Whether a planned write is a desktop session entry (not a tombstone).
+fn is_desktop_entry(category: CategoryId, category_path: &Path) -> bool {
+    category == CategoryId::DesktopSessions && desktop_sessions::is_index_path(category_path)
+}
+
+/// Drop the kept merge bases no base record refers to any more.
+fn prune_merge_bases(claude_dir: &Path) {
+    let prefix = format!("{ARTIFACTS_SUBDIR}/{}/", desktop_sessions::REPO_SUBDIR);
+    let keep = bases::recorded_hashes_under(claude_dir, &prefix);
+    desktop_sessions::prune_bases(claude_dir, &keep);
+}
+
+/// The transcript ids tombstoned on this machine or in the repository —
+/// the union, since tombstones travel both ways and only ever accumulate.
+fn tombstoned_everywhere(filter: &FilterConfig, category_root: &Path) -> HashSet<String> {
+    let mut ids = desktop_sessions::dir(filter)
+        .map(|dir| desktop_sessions::tombstoned_ids(&dir))
+        .unwrap_or_default();
+    ids.extend(desktop_sessions::tombstoned_ids(category_root));
+    ids
+}
+
+/// Whether a desktop session entry's transcript is tombstoned.
+fn entry_is_dead(bytes: &[u8], tombstoned: &HashSet<String>) -> bool {
+    desktop_sessions::cli_session_id(bytes).is_some_and(|cli| tombstoned.contains(&cli))
+}
+
+/// Remove from the repository every desktop session entry whose transcript
+/// is tombstoned: the session was deleted in the app on some machine, and
+/// the tombstone — not the entry — is what every machine must keep. Returns
+/// the category-relative paths removed.
+fn remove_tombstoned_entries(
+    category_root: &Path,
+    repo_root: &Path,
+    tombstoned: &HashSet<String>,
+    deltas: &mut RecordDeltas,
+) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    if tombstoned.is_empty() || !category_root.is_dir() {
+        return removed;
+    }
+    for entry in walkdir::WalkDir::new(category_root)
+        .min_depth(3)
+        .max_depth(3)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let abs = entry.path();
+        let rel = abs.strip_prefix(category_root).unwrap_or(abs).to_path_buf();
+        if !desktop_sessions::is_syncable_rel(&rel) || !desktop_sessions::is_index_path(&rel) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(abs) else {
+            continue;
+        };
+        if !entry_is_dead(&bytes, tombstoned) {
+            continue;
+        }
+        if let Err(e) = fs::remove_file(abs) {
+            log::warn!("Could not remove tombstoned {}: {e}", abs.display());
+            continue;
+        }
+        if let Some(repo_rel) = repo_relative(repo_root, abs) {
+            deltas.bases_removals.push(repo_rel.clone());
+            deltas.tracked_removals.push(repo_rel);
+        }
+        removed.push(rel);
+    }
+    removed
 }
 
 /// Write `content` to `path` via a same-directory temp file + atomic rename,
@@ -651,8 +802,11 @@ pub fn push_artifacts(
     skip_artifact_paths: &HashSet<(CategoryId, PathBuf)>,
 ) -> Result<ArtifactReport> {
     let mut report = ArtifactReport::default();
-    let tokens = PathTokens::for_claude_dir(claude_dir);
+    let tokens = PathTokens::for_claude_dir(claude_dir).with_project_map(&filter.project_map);
     let tracked_before = tracked::load(claude_dir, repo_root);
+    // Only the desktop session merge consults it: the version both sides
+    // started from, when a repo entry and the local one both moved on.
+    let base_hashes: BaseHashes = bases::load(claude_dir, repo_root);
     // The deltas this push owns. Both records are saved as deltas merged
     // into a fresh load, never as a start-of-push map: a same-repo pull
     // can record entries while this push runs, and a whole-entry save
@@ -672,6 +826,14 @@ pub fn push_artifacts(
             &mut held_back,
         )?;
         let category_root = category_repo_root(desc, repo_root, filter);
+        // Desktop sessions: an entry whose transcript is tombstoned anywhere
+        // is dead everywhere — never published, and removed from the
+        // repository below.
+        let tombstoned: HashSet<String> = if desc.id == CategoryId::DesktopSessions {
+            tombstoned_everywhere(filter, &category_root)
+        } else {
+            HashSet::new()
+        };
         // The tracked record is the durable "this machine has seen this
         // file" set. The push consults it to refuse resurrecting a file
         // the remote lost between syncs (adversarial review 2026-10-09,
@@ -769,6 +931,106 @@ pub fn push_artifacts(
                         counts.unchanged += 1;
                     }
                 }
+                MergeStrategy::SessionIndex => {
+                    let read_bytes = match fs::read(&file.abs) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            hold_back(&mut counts, &file.abs, "unreadable", &e);
+                            continue;
+                        }
+                    };
+                    let is_entry = desktop_sessions::is_index_path(&file.rel);
+                    if is_entry && entry_is_dead(&read_bytes, &tombstoned) {
+                        // The app on this machine has not caught up with a
+                        // deletion made elsewhere (or made here, moments
+                        // ago): the pull removes the entry.
+                        log::info!(
+                            "Not publishing {} (its transcript is tombstoned)",
+                            file.rel.display()
+                        );
+                        continue;
+                    }
+                    // The base is the LOCAL bytes as pushed, like the raw
+                    // arm — and kept whole for the next three-way merge.
+                    base_hash = Some(bases::hash_bytes(&read_bytes));
+                    if is_entry {
+                        keep_merge_base(claude_dir, &read_bytes);
+                    }
+                    let src_bytes = repo_form(desc, &tokens, &read_bytes);
+                    let existed = dest.is_file();
+                    if !existed {
+                        // Same refusal as the raw arm: a file the remote
+                        // lost since this machine last had it is not
+                        // silently resurrected.
+                        let repo_rel = repo_relative(repo_root, &category_root.join(&file.rel));
+                        if repo_rel
+                            .as_ref()
+                            .map(|r| tracked_before.contains(r))
+                            .unwrap_or(false)
+                        {
+                            log::warn!(
+                                "Not re-publishing {}: the remote lost this file since the last sync; the local copy is preserved",
+                                file.rel.display()
+                            );
+                            counts.held_back_remote_lost += 1;
+                            report.record(
+                                desc.id,
+                                ArtifactChangeKind::HeldBackRemoteLost,
+                                &file.rel,
+                            );
+                            continue;
+                        }
+                        if let Err(e) = write_atomic(&dest, &src_bytes, &file.abs) {
+                            hold_back(&mut counts, &file.abs, "repo write failed", &e);
+                            continue;
+                        }
+                        counts.added += 1;
+                        report.record(desc.id, ArtifactChangeKind::Added, &file.rel);
+                    } else {
+                        let dest_bytes = match fs::read(&dest) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                hold_back(&mut counts, &file.abs, "repo copy unreadable", &e);
+                                continue;
+                            }
+                        };
+                        if dest_bytes == src_bytes {
+                            counts.unchanged += 1;
+                        } else {
+                            // The repository copy may carry another
+                            // machine's changes: merge, never overwrite.
+                            // Against the version both started from when
+                            // this machine still holds it; two-way (later
+                            // activity wins) otherwise.
+                            let name = file
+                                .rel
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_default();
+                            let repo_machine = render_machine(desc, &tokens, &dest_bytes);
+                            let base = repo_relative(repo_root, &dest)
+                                .and_then(|rel| base_hashes.get(&rel))
+                                .and_then(|hash| desktop_sessions::load_base(claude_dir, hash));
+                            let merged = desktop_sessions::merge_bytes(
+                                name,
+                                &read_bytes,
+                                &repo_machine,
+                                base.as_deref(),
+                            );
+                            let merged_repo = repo_form(desc, &tokens, &merged);
+                            if merged_repo != dest_bytes {
+                                if let Err(e) = write_atomic(&dest, &merged_repo, &file.abs) {
+                                    hold_back(&mut counts, &file.abs, "repo write failed", &e);
+                                    continue;
+                                }
+                                counts.modified += 1;
+                                report.record(desc.id, ArtifactChangeKind::Modified, &file.rel);
+                            } else {
+                                counts.unchanged += 1;
+                            }
+                        }
+                    }
+                }
                 MergeStrategy::UnionMemoryIndex | MergeStrategy::RawOverwrite => {
                     // Never fatal, matching the pull side: an unreadable
                     // local file is held back and warned, so a bad file
@@ -788,11 +1050,7 @@ pub fn push_artifacts(
                     // one shared rule (see `records_base`).
                     base_hash =
                         records_base(desc.merge, &file.rel).then(|| bases::hash_bytes(&read_bytes));
-                    let mut src_bytes = if desc.tokenize_paths {
-                        tokens.to_repo(&read_bytes)
-                    } else {
-                        read_bytes
-                    };
+                    let mut src_bytes = repo_form(desc, &tokens, &read_bytes);
                     // Repo-side IO is never fatal either: one bad repo
                     // file must not wedge every later push.
                     // Merged lines count only once a write lands (see the
@@ -892,6 +1150,15 @@ pub fn push_artifacts(
             }
         }
 
+        if desc.id == CategoryId::DesktopSessions {
+            for path in
+                remove_tombstoned_entries(&category_root, repo_root, &tombstoned, &mut deltas)
+            {
+                counts.deleted += 1;
+                report.record(desc.id, ArtifactChangeKind::Deleted, &path);
+            }
+        }
+
         if desc.mirror_deletes {
             if source_is_present(desc, claude_dir) {
                 // The marker only keeps an emptied directory alive; failing
@@ -974,6 +1241,9 @@ pub fn push_artifacts(
             log::warn!("Base record NOT saved (files are already pushed): {e}");
         }
     }
+    if active_categories(filter).any(|desc| desc.id == CategoryId::DesktopSessions) {
+        prune_merge_bases(claude_dir);
+    }
     Ok(report)
 }
 
@@ -1025,6 +1295,9 @@ fn source_is_present(desc: &CategoryDescriptor, claude_dir: &Path) -> bool {
     match desc.source {
         SourceSpec::Files(_) => true,
         SourceSpec::Dir(dir) => claude_dir.join(dir).is_dir(),
+        // Never consulted: the category does not mirror deletions (its
+        // tombstones carry them), and both callers are gated on that.
+        SourceSpec::DesktopSessions => false,
     }
 }
 
@@ -1183,6 +1456,16 @@ pub struct PullPlan {
     /// the last sync: kept instead of deleted, for the same reason as
     /// `kept_local` — a `push` is what publishes the decision to drop them.
     pub kept_local_deletes: Vec<PlannedDelete>,
+    /// Desktop session entries whose transcript is tombstoned (deleted in
+    /// the app on some machine): removed regardless of local edits — the
+    /// app rewrites every entry it shows, so an "edit" here is a focus
+    /// timestamp, not work — after a snapshot, so `undo pull` restores them.
+    pub tombstoned_deletes: Vec<PlannedDelete>,
+    /// Desktop session entries verified identical on both sides, with the
+    /// hash the plan verified: the apply keeps their bytes as merge bases
+    /// when it does not hold them yet (a self-heal; the push and every
+    /// write keep them as they go).
+    pub desktop_verified: Vec<(PathBuf, String)>,
     pub unchanged: usize,
     /// Repo files refused (denied names, unsafe paths).
     pub skipped: usize,
@@ -1295,6 +1578,7 @@ impl PullPlan {
             && self.deletes.is_empty()
             && self.kept_local.is_empty()
             && self.kept_local_deletes.is_empty()
+            && self.tombstoned_deletes.is_empty()
     }
 
     /// True when applying the plan writes anything on this machine:
@@ -1318,7 +1602,8 @@ impl PullPlan {
             && self.date_settles.is_empty()
             && self.creates.is_empty()
             && self.unions.is_empty()
-            && self.deletes.is_empty())
+            && self.deletes.is_empty()
+            && self.tombstoned_deletes.is_empty())
             || (interactive
                 && (!self.kept_local.is_empty() || !self.kept_local_deletes.is_empty()));
         file_writes || self.rewrites_bases || self.rewrites_tracked
@@ -1346,6 +1631,7 @@ impl PullPlan {
         keys.extend(self.base_hashes.iter().map(|(rel, _)| rel.clone()));
         keys.extend(self.deletes.iter().map(|d| d.repo_rel.clone()));
         keys.extend(self.kept_local_deletes.iter().map(|d| d.repo_rel.clone()));
+        keys.extend(self.tombstoned_deletes.iter().map(|d| d.repo_rel.clone()));
         keys.extend(self.base_prunes.iter().cloned());
         keys
     }
@@ -1417,6 +1703,7 @@ impl PullPlan {
             .chain(self.unions.iter())
             .map(|w| w.local_path.clone())
             .chain(self.deletes.iter().map(|d| d.local_path.clone()))
+            .chain(self.tombstoned_deletes.iter().map(|d| d.local_path.clone()))
             .collect();
         if interactive {
             paths.extend(self.kept_local.iter().map(|w| w.local_path.clone()));
@@ -1491,6 +1778,17 @@ fn collect_repo_files(
             *skipped += 1;
             continue;
         }
+        // The allowlist holds on pull as well as push: only entries and
+        // tombstones, exactly two levels down, ever reach the app's directory.
+        if desc.source == SourceSpec::DesktopSessions && !desktop_sessions::is_syncable_rel(&rel) {
+            log::warn!(
+                "Skipping {} (not a file the {} category restores)",
+                abs.display(),
+                desc.name
+            );
+            *skipped += 1;
+            continue;
+        }
         // The size limit applies to the repo side too — the mirror of the
         // push-side guard: another machine with a higher limit may have
         // pushed a file this one must not write. Held back, NOT gone:
@@ -1551,6 +1849,14 @@ fn local_destination(
             }
             Ok(claude_dir.join(dir).join(rel))
         }
+        SourceSpec::DesktopSessions => {
+            if !desktop_sessions::is_syncable_rel(rel) {
+                return Err(SkipReason::NotRestorable);
+            }
+            desktop_sessions::dir(filter)
+                .map(|dir| dir.join(rel))
+                .ok_or(SkipReason::NotRestorable)
+        }
     }
 }
 
@@ -1563,10 +1869,7 @@ fn machine_bytes(
 ) -> Result<Vec<u8>> {
     let bytes = fs::read(repo_path)
         .with_context(|| format!("Failed to read artifact {}", repo_path.display()))?;
-    if desc.tokenize_paths {
-        return Ok(tokens.to_machine(&bytes));
-    }
-    Ok(bytes)
+    Ok(render_machine(desc, tokens, &bytes))
 }
 
 /// The registry row for one category.
@@ -1582,7 +1885,7 @@ pub(crate) fn descriptor(id: CategoryId) -> &'static CategoryDescriptor {
 /// file this machine synced before and the repo no longer has is a deletion.
 pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> Result<PullPlan> {
     let mut plan = PullPlan {
-        tokens: PathTokens::for_claude_dir(claude_dir),
+        tokens: PathTokens::for_claude_dir(claude_dir).with_project_map(&filter.project_map),
         claude_dir: claude_dir.to_path_buf(),
         repo_root: repo_root.to_path_buf(),
         merge_tool: filter.merge_tool.clone(),
@@ -1638,6 +1941,28 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
 
     for desc in active_categories(filter) {
         let category_root = category_repo_root(desc, repo_root, filter);
+        // The desktop app creates its session directory the first time it
+        // runs on a machine; until then there is nowhere it would read the
+        // entries from, and nothing is written.
+        let desktop_dir = match desc.source {
+            SourceSpec::DesktopSessions => match desktop_sessions::dir(filter) {
+                Some(dir) if dir.is_dir() => Some(dir),
+                _ => {
+                    log::info!(
+                        "Category {} is skipped: no Claude desktop app session list on this machine",
+                        desc.name
+                    );
+                    continue;
+                }
+            },
+            _ => None,
+        };
+        let tombstoned: HashSet<String> = if desktop_dir.is_some() {
+            tombstoned_everywhere(filter, &category_root)
+        } else {
+            HashSet::new()
+        };
+        let mut tombstoned_planned: HashSet<PathBuf> = HashSet::new();
         let mut present: TrackedPaths = TrackedPaths::new();
 
         let mut repo_held_back = Vec::new();
@@ -1696,6 +2021,98 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
             };
 
             match desc.merge {
+                MergeStrategy::SessionIndex => {
+                    let repo_rel = repo_relative(repo_root, &repo_path);
+                    if desktop_sessions::is_index_path(&rel) {
+                        let Ok(repo_raw) = fs::read(&repo_path) else {
+                            log::warn!("Skipping {} (repo copy unreadable)", repo_path.display());
+                            plan.skipped += 1;
+                            continue;
+                        };
+                        if entry_is_dead(&repo_raw, &tombstoned) {
+                            // Deleted in the app somewhere: never created
+                            // here, and removed if this machine still shows
+                            // it. The push drops the repository copy.
+                            if local_path.is_file() {
+                                plan.tombstoned_deletes.push(PlannedDelete {
+                                    category: desc.id,
+                                    local_path: local_path.clone(),
+                                    category_path: rel.clone(),
+                                    repo_rel: repo_rel.clone().unwrap_or_default(),
+                                });
+                                tombstoned_planned.insert(local_path);
+                            }
+                            continue;
+                        }
+                    }
+                    let repo_bytes = match machine_bytes(desc, &plan.tokens, &repo_path) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            log::warn!(
+                                "Skipping {} (repo copy unreadable): {e}",
+                                repo_path.display()
+                            );
+                            plan.skipped += 1;
+                            continue;
+                        }
+                    };
+                    // A session in a project this machine has not mapped
+                    // has no working directory here, exactly like the
+                    // project's transcripts: skipped, and named once.
+                    if let Some(project) = PathTokens::unmapped_project(&repo_bytes) {
+                        plan.skipped += 1;
+                        plan.unmapped_projects
+                            .entry(project)
+                            .or_default()
+                            .push(repo_path);
+                        continue;
+                    }
+                    if !local_path.is_file() {
+                        plan.creates.push(write);
+                        continue;
+                    }
+                    if outside_size_limit(&local_path, filter) {
+                        log::warn!(
+                            "Skipping {} (unreadable or exceeds max_file_size_bytes)",
+                            local_path.display()
+                        );
+                        plan.skipped += 1;
+                        continue;
+                    }
+                    let Ok(local_bytes) = fs::read(&local_path) else {
+                        log::warn!("Skipping {} (unreadable)", local_path.display());
+                        plan.skipped += 1;
+                        continue;
+                    };
+                    if local_bytes == repo_bytes {
+                        let hash = bases::hash_bytes(&local_bytes);
+                        if let Some(rel) = repo_rel {
+                            plan.base_hashes.push((rel, hash.clone()));
+                        }
+                        if desktop_sessions::is_index_path(&rel) {
+                            plan.desktop_verified.push((local_path, hash));
+                        }
+                        plan.unchanged += 1;
+                        continue;
+                    }
+                    let recorded = repo_rel.as_ref().and_then(|r| base_hashes.get(r));
+                    let f3 = repo_rel
+                        .as_ref()
+                        .map(|r| f3_class_potentially_dirty(&base_hashes, &plan.tracked_before, r))
+                        .unwrap_or(false)
+                        || (recorded.is_none() && synced_this_repo_before);
+                    if repo_unchanged_since_sync(recorded, &repo_bytes) {
+                        // Only this machine moved on: the push publishes it.
+                        plan.local_only.push(write);
+                    } else if f3 || bases::is_dirty(recorded, &local_bytes) {
+                        // Both sides moved on. The app rewrites every entry
+                        // it opens, so holding the file back would never
+                        // settle: merged on apply instead, field by field.
+                        plan.unions.push(write);
+                    } else {
+                        plan.overwrites.push(write);
+                    }
+                }
                 MergeStrategy::UnionJsonl => {
                     if !local_path.is_file() {
                         plan.creates.push(write);
@@ -1963,6 +2380,33 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
             }
         }
 
+        if desktop_dir.is_some() {
+            // Entries only this machine holds whose transcript a tombstone
+            // (from anywhere) names: deleted in the app elsewhere, so gone
+            // here too — the app on this machine would never show them again.
+            let mut held = Vec::new();
+            for file in collect(desc, claude_dir, filter, &mut plan.skipped, &mut held)? {
+                if !desktop_sessions::is_index_path(&file.rel)
+                    || tombstoned_planned.contains(&file.abs)
+                {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&file.abs) else {
+                    continue;
+                };
+                if entry_is_dead(&bytes, &tombstoned) {
+                    let repo_rel = repo_relative(repo_root, &category_root.join(&file.rel))
+                        .unwrap_or_default();
+                    plan.tombstoned_deletes.push(PlannedDelete {
+                        category: desc.id,
+                        local_path: file.abs,
+                        category_path: file.rel,
+                        repo_rel,
+                    });
+                }
+            }
+        }
+
         if !desc.mirror_deletes {
             continue;
         }
@@ -2155,6 +2599,7 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
             || plan
                 .deletes
                 .iter()
+                .chain(&plan.tombstoned_deletes)
                 .any(|d| base_hashes.contains_key(&d.repo_rel))
             || plan
                 .base_hashes
@@ -2491,6 +2936,9 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
                 &write.repo_path,
                 &bytes,
             );
+        }
+        if is_desktop_entry(write.category, &write.category_path) {
+            keep_merge_base(&plan.claude_dir, &bytes);
         }
         counts_for(&mut by_category, write.category).added += 1;
         report.record(
@@ -3127,6 +3575,9 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
             &write.repo_path,
             &repo_bytes,
         );
+        if is_desktop_entry(write.category, &write.category_path) {
+            keep_merge_base(&plan.claude_dir, &repo_bytes);
+        }
         counts_for(&mut by_category, write.category).modified += 1;
         report.record(
             write.category,
@@ -3182,6 +3633,24 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
         };
         let (merged, new_entries) = match desc.merge {
             MergeStrategy::UnionMemoryIndex => merge_memory_index(&local_bytes, &repo_bytes),
+            MergeStrategy::SessionIndex => {
+                // Three-way against the version both sides started from —
+                // the bytes the recorded base names, when this machine
+                // still keeps them — and two-way (later activity wins)
+                // otherwise.
+                let name = write
+                    .category_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                let base = repo_relative(&plan.repo_root, &write.repo_path)
+                    .and_then(|rel| synced_bases.get(&rel).cloned())
+                    .and_then(|hash| desktop_sessions::load_base(&plan.claude_dir, &hash));
+                (
+                    desktop_sessions::merge_bytes(name, &local_bytes, &repo_bytes, base.as_deref()),
+                    0,
+                )
+            }
             _ => {
                 // Strict UTF-8 decode — `from_utf8_lossy` would silently
                 // substitute invalid sequences with U+FFFD, corrupting
@@ -3233,16 +3702,32 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
         // what prompt-history union-merge guarantees. The gate is the
         // shared per-file rule kept so a future strategy that belongs
         // here inherits the correct behavior automatically.
+        //
+        // A desktop session entry records the REPOSITORY bytes instead:
+        // the merge is three-way, and the repository version is what
+        // both sides now share — relative to it the merged file holds
+        // only this machine's changes, which the push then publishes
+        // (merging against that same base if the other machine moved
+        // on again meanwhile). Recording the merged bytes would make the
+        // push read every remote change as "ours" and revert it.
+        let base_bytes: &[u8] = if desc.merge == MergeStrategy::SessionIndex {
+            &repo_bytes
+        } else {
+            &merged
+        };
         if records_base(desc.merge, &write.category_path)
             && record_base(
                 &mut synced_bases,
                 &mut bases_inserts,
                 &plan.repo_root,
                 &write.repo_path,
-                &merged,
+                base_bytes,
             )
         {
             bases_changed = true;
+        }
+        if is_desktop_entry(write.category, &write.category_path) {
+            keep_merge_base(&plan.claude_dir, &repo_bytes);
         }
         let counts = counts_for(&mut by_category, write.category);
         counts.modified += 1;
@@ -3271,6 +3756,41 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
                 &write.category_path,
             );
         }
+    }
+
+    for delete in &plan.tombstoned_deletes {
+        // No backup, no deletion (see `unsnapshotted`).
+        if plan.unsnapshotted.contains(&delete.local_path) {
+            log::warn!(
+                "Skipping delete of {} (no pre-pull backup could be taken; retried next pull)",
+                delete.local_path.display()
+            );
+            counts_for(&mut by_category, delete.category).skipped += 1;
+            continue;
+        }
+        // No dirty check and no prompt: the app rewrites an entry on every
+        // focus, so a "local edit" here is a timestamp, and the session
+        // was deleted in the app — the one decision these files carry.
+        if delete.local_path.is_file() {
+            if let Err(e) = fs::remove_file(&delete.local_path) {
+                log::warn!(
+                    "Skipping delete of {} (remove failed): {e}",
+                    delete.local_path.display()
+                );
+                counts_for(&mut by_category, delete.category).skipped += 1;
+                continue;
+            }
+        }
+        if synced_bases.remove(&delete.repo_rel).is_some() {
+            bases_changed = true;
+            bases_removals.push(delete.repo_rel.clone());
+        }
+        counts_for(&mut by_category, delete.category).deleted += 1;
+        report.record(
+            delete.category,
+            ArtifactChangeKind::Deleted,
+            &delete.category_path,
+        );
     }
 
     // Deletes that did not EXECUTE (unreadable at apply time, remove
@@ -3462,6 +3982,16 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
             bases_inserts.insert(rel.clone(), hash.clone());
         }
     }
+    // Entries verified identical on both sides: their bytes are the base
+    // the record names, kept here if this machine does not hold them yet
+    // — only when the file still hashes to what the plan verified.
+    for (local_path, hash) in &plan.desktop_verified {
+        if let Ok(bytes) = fs::read(local_path) {
+            if bases::hash_bytes(&bytes) == *hash {
+                keep_merge_base(&plan.claude_dir, &bytes);
+            }
+        }
+    }
     // Files that exist nowhere anymore: their entries go too (no counts —
     // nothing visible happened to any file).
     for rel in &plan.base_prunes {
@@ -3564,6 +4094,7 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
     // later push must not have "restored".
     report.bases_keys_written = bases_keys_written;
     report.tracked_keys_written = tracked_keys_written;
+    prune_merge_bases(&plan.claude_dir);
 
     report.counts = by_category.into_values().collect();
     report.counts.sort_by_key(|c| c.category as usize);

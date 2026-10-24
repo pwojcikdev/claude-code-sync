@@ -231,3 +231,174 @@ fn a_shorter_window_purges_more() {
     assert_eq!(purged, vec!["a", "b"], "oldest first, newest kept");
     assert_eq!(plan.oldest_age_days(), 400);
 }
+
+// ---------------------------------------------------------------------------
+// The desktop app's session entries go with their transcripts
+// ---------------------------------------------------------------------------
+
+use claude_code_sync::artifacts::{bases, tracked};
+
+/// A desktop app session entry under `root/org-1/account-1/local_<id>.json`
+/// pointing at transcript `cli`.
+fn desktop_entry(root: &Path, id: &str, cli: &str) -> PathBuf {
+    let account = root.join("org-1").join("account-1");
+    fs::create_dir_all(&account).unwrap();
+    let path = account.join(format!("local_{id}.json"));
+    fs::write(
+        &path,
+        format!(r#"{{"sessionId":"local_{id}","cliSessionId":"{cli}","title":"t"}}"#),
+    )
+    .unwrap();
+    path
+}
+
+fn tombstone(entry: &Path, cli: &str) -> PathBuf {
+    entry.parent().unwrap().join(format!("deleted_{cli}"))
+}
+
+#[test]
+fn desktop_entries_for_purged_transcripts_are_retired_with_tombstones() {
+    let claude = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let desktop = TempDir::new().unwrap();
+    let projects = claude.path().join("projects");
+    let repo_projects = repo.path().join("projects");
+    transcript(&projects, "-home-user-app", "old-session", 400);
+    transcript(&repo_projects, "-home-user-app", "old-session", 400);
+    transcript(&projects, "-home-user-app", "recent", 10);
+
+    let old_here = desktop_entry(desktop.path(), "a", "old-session");
+    let recent_here = desktop_entry(desktop.path(), "b", "recent");
+    let category = repo.path().join("artifacts").join("desktop-sessions");
+    let old_in_repo = desktop_entry(&category, "a", "old-session");
+    let recent_in_repo = desktop_entry(&category, "b", "recent");
+    // This machine's records file the repository copy, as a sync would.
+    let repo_rel = "artifacts/desktop-sessions/org-1/account-1/local_a.json".to_string();
+    bases::save(
+        claude.path(),
+        repo.path(),
+        [(repo_rel.clone(), "hash".to_string())]
+            .into_iter()
+            .collect(),
+    )
+    .unwrap();
+    tracked::save(
+        claude.path(),
+        repo.path(),
+        [repo_rel.clone()].into_iter().collect(),
+    )
+    .unwrap();
+
+    let mut plan = purge::plan(&projects, &repo_projects, MINIMUM_RETENTION_DAYS).unwrap();
+    purge::retire_desktop_entries(&mut plan, Some(desktop.path()), repo.path());
+    assert_eq!(plan.targets.len(), 1);
+    assert_eq!(plan.desktop_entries.len(), 2, "{:?}", plan.desktop_entries);
+    let repo_entry = plan
+        .desktop_entries
+        .iter()
+        .find(|e| e.path == old_in_repo)
+        .expect("the repository copy is planned");
+    assert_eq!(repo_entry.repo_rel.as_deref(), Some(repo_rel.as_str()));
+    assert_eq!(repo_entry.transcript_id, "old-session");
+    // Planning (a dry run) touches nothing.
+    assert!(old_here.is_file() && old_in_repo.is_file());
+    assert!(!tombstone(&old_here, "old-session").exists());
+
+    let report = purge::apply(&plan).unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.sessions, 1);
+    assert_eq!(report.desktop_entries, 2);
+    assert!(!old_here.exists());
+    assert!(!old_in_repo.exists());
+    assert!(
+        recent_here.is_file(),
+        "an entry for a kept transcript stays"
+    );
+    assert!(recent_in_repo.is_file());
+    for stone in [
+        tombstone(&old_here, "old-session"),
+        tombstone(&old_in_repo, "old-session"),
+    ] {
+        let at: i64 = fs::read_to_string(&stone).unwrap().trim().parse().unwrap();
+        assert!(
+            at > 1_700_000_000_000,
+            "epoch milliseconds, as the app writes"
+        );
+    }
+    assert!(!tombstone(&recent_here, "recent").exists());
+
+    purge::forget_desktop_records(claude.path(), repo.path(), &plan).unwrap();
+    assert!(!bases::load(claude.path(), repo.path()).contains_key(&repo_rel));
+    assert!(!tracked::load(claude.path(), repo.path()).contains(&repo_rel));
+}
+
+#[test]
+fn an_existing_tombstone_is_kept_and_a_machine_without_the_app_only_touches_the_repo() {
+    let claude = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let projects = claude.path().join("projects");
+    let repo_projects = repo.path().join("projects");
+    transcript(&repo_projects, "-home-user-app", "old-session", 400);
+    let category = repo.path().join("artifacts").join("desktop-sessions");
+    let old_in_repo = desktop_entry(&category, "a", "old-session");
+    fs::write(tombstone(&old_in_repo, "old-session"), "1785953402585").unwrap();
+
+    let mut plan = purge::plan(&projects, &repo_projects, MINIMUM_RETENTION_DAYS).unwrap();
+    purge::retire_desktop_entries(&mut plan, None, repo.path());
+    assert_eq!(plan.desktop_entries.len(), 1);
+
+    let report = purge::apply(&plan).unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(!old_in_repo.exists());
+    assert_eq!(
+        fs::read_to_string(tombstone(&old_in_repo, "old-session")).unwrap(),
+        "1785953402585",
+        "an earlier deletion keeps its time"
+    );
+    // Nothing to forget: no repository entry was recorded here.
+    purge::forget_desktop_records(claude.path(), repo.path(), &plan).unwrap();
+
+    // And with nothing purged, nothing is retired either.
+    let mut empty = purge::plan(&projects, &repo_projects, MINIMUM_RETENTION_DAYS).unwrap();
+    purge::retire_desktop_entries(&mut empty, None, repo.path());
+    assert!(empty.desktop_entries.is_empty());
+}
+
+#[test]
+fn the_other_machine_drops_its_entry_on_the_next_pull() {
+    use claude_code_sync::artifacts::engine::{apply_pull, plan_pull};
+    use claude_code_sync::artifacts::registry::ArtifactToggles;
+    use claude_code_sync::filter::FilterConfig;
+
+    // Machine A purged: the repository holds the tombstone and no entry.
+    let repo = TempDir::new().unwrap();
+    let category = repo.path().join("artifacts").join("desktop-sessions");
+    let purged = desktop_entry(&category, "a", "old-session");
+    fs::remove_file(&purged).unwrap();
+    fs::write(tombstone(&purged, "old-session"), "1785953402585").unwrap();
+    desktop_entry(&category, "b", "recent");
+
+    // Machine B still lists the session.
+    let claude_b = TempDir::new().unwrap();
+    let desktop_b = TempDir::new().unwrap();
+    let entry_b = desktop_entry(desktop_b.path(), "a", "old-session");
+    let filter = FilterConfig {
+        sync_artifacts: ArtifactToggles {
+            desktop_sessions: true,
+            ..Default::default()
+        },
+        desktop_sessions_root: Some(desktop_b.path().to_path_buf()),
+        ..Default::default()
+    };
+
+    let plan = plan_pull(claude_b.path(), repo.path(), &filter).unwrap();
+    assert_eq!(plan.tombstoned_deletes.len(), 1);
+    assert_eq!(plan.creates.len(), 2, "the tombstone and the kept entry");
+    apply_pull(&plan, false).unwrap();
+    assert!(!entry_b.exists());
+    assert_eq!(
+        fs::read_to_string(tombstone(&entry_b, "old-session")).unwrap(),
+        "1785953402585"
+    );
+    assert!(entry_b.parent().unwrap().join("local_b.json").is_file());
+}

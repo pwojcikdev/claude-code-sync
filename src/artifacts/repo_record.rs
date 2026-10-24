@@ -420,6 +420,11 @@ impl<V: Clone + for<'de> Deserialize<'de> + Serialize> RepoRecord<V> {
         removed
     }
 
+    /// Every repository's entry, in no particular order.
+    pub fn entries(&self) -> impl Iterator<Item = &V> {
+        self.repos.values()
+    }
+
     /// Whether `repo_root` is filed under a non-canonical spelling — an
     /// older version's raw key. The next `insert` retires it, which
     /// rewrites the file; writers that predict their writes need to know.

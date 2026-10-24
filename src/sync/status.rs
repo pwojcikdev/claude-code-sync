@@ -81,6 +81,16 @@ pub fn show_status(show_conflicts: bool, show_files: bool, held_back: bool) -> R
                 println!("  {}: {}", desc.name, "disabled".dimmed());
                 continue;
             }
+            if desc.source == crate::artifacts::registry::SourceSpec::DesktopSessions
+                && !crate::artifacts::desktop_sessions::dir(&filter).is_some_and(|dir| dir.is_dir())
+            {
+                println!(
+                    "  {}: {}",
+                    desc.name,
+                    "skipped (no Claude desktop app session list on this machine)".dimmed()
+                );
+                continue;
+            }
             let differing = plan
                 .overwrites
                 .iter()
@@ -97,6 +107,7 @@ pub fn show_status(show_conflicts: bool, show_files: bool, held_back: bool) -> R
                     .deletes
                     .iter()
                     .chain(plan.kept_local_deletes.iter())
+                    .chain(plan.tombstoned_deletes.iter())
                     .filter(|d| d.category == desc.id)
                     .count();
             if differing == 0 {
