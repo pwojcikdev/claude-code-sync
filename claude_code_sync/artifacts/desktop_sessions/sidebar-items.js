@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REPO_SUBDIR"],"fn":["bases_dir","cli_session_id","default_dir","dir","entries_for_transcripts","is_index_file","is_index_path","is_syncable_rel","is_tombstone","load_base","merge_bytes","merge_index","merge_tombstone","prune_bases","repo_category_root","settle_repo_conflict","store_base","tombstone_beside","tombstoned_ids"]};

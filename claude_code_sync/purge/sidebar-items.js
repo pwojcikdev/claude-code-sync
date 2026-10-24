@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CLAUDE_CODE_DEFAULT_RETENTION_DAYS","MINIMUM_RETENTION_DAYS"],"fn":["apply","commit_removals","ensure_nothing_uncommitted","forget_desktop_records","open_sync_repo","plan","retention_days","retire_desktop_entries"],"struct":["DesktopEntry","PurgePlan","PurgeReport","PurgeTarget"]};
